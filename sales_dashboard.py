@@ -3,8 +3,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import re
-import os
 from datetime import datetime
+from google.oauth2.service_account import Credentials
+import gspread
 
 st.set_page_config(page_title="Winston Quinn · Sales Dashboard", layout="wide", page_icon="🥃")
 
@@ -36,7 +37,6 @@ h1,h2,h3 { font-family: 'Playfair Display', serif !important; color: #f0ece4 !im
 def check_login():
     if st.session_state.get("authenticated"):
         return True
-
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
         st.markdown("<br><br>", unsafe_allow_html=True)
@@ -56,7 +56,8 @@ def check_login():
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign In", use_container_width=True)
             if submitted:
-                if username == "wq" and password == "wq1010":
+                if (username == st.secrets["auth"]["username"] and
+                        password == st.secrets["auth"]["password"]):
                     st.session_state["authenticated"] = True
                     st.rerun()
                 else:
@@ -66,10 +67,11 @@ def check_login():
 if not check_login():
     st.stop()
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+SPREADSHEET_ID = "1arHaLL7g4Z6Ikf6oY1WC1ad9yIBEFSjY17Eg428__js"
 REPS = ["Max", "Luke", "James", "WQ", "Winston Quinn", "Tristan", "Erica"]
 GOLD, GREEN, RED = "#c9a84c", "#7eb87e", "#c07070"
 
-# Base layout — NO legend key here to avoid conflicts
 PLOT_BASE = dict(
     plot_bgcolor="#161410", paper_bgcolor="#161410",
     font=dict(family="DM Sans", color="#a09080"),
@@ -81,43 +83,56 @@ PLOT_BASE = dict(
 )
 
 def apply_layout(fig, horizontal_legend=False, **kwargs):
-    """Apply PLOT_BASE then optionally legend, then any extra kwargs — never conflicts."""
     fig.update_layout(**PLOT_BASE)
     if horizontal_legend:
-        fig.update_layout(legend=dict(
-            bgcolor="rgba(0,0,0,0)", font=dict(color="#a09080"),
-            orientation="h", y=-0.22
-        ))
+        fig.update_layout(legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#a09080"), orientation="h", y=-0.22))
     else:
-        fig.update_layout(legend=dict(
-            bgcolor="rgba(0,0,0,0)", font=dict(color="#a09080")
-        ))
+        fig.update_layout(legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#a09080")))
     if kwargs:
         fig.update_layout(**kwargs)
     return fig
 
+# ── Google Sheets connection ───────────────────────────────────────────────────
+@st.cache_resource
+def get_gspread_client():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly",
+                "https://www.googleapis.com/auth/drive.readonly"],
+    )
+    return gspread.authorize(creds)
+
+@st.cache_data(ttl=300)
+def get_sheet_names():
+    client = get_gspread_client()
+    ss = client.open_by_key(SPREADSHEET_ID)
+    return [ws.title for ws in ss.worksheets()]
+
+@st.cache_data(ttl=300)
+def get_sheet_rows(title):
+    client = get_gspread_client()
+    ss = client.open_by_key(SPREADSHEET_ID)
+    return ss.worksheet(title).get_all_values()
+
+# ── Parser ────────────────────────────────────────────────────────────────────
 def to_num(s):
     if not s: return 0.0
     return float(re.sub(r'[$,\s]', '', str(s)) or 0)
 
-def parse_csv(source, label=""):
-    if hasattr(source, 'read'):
-        content = source.read().decode('utf-8', errors='replace')
-    else:
-        with open(source, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    lines = content.splitlines()
+def parse_rows(rows, label=""):
     records = []
     date_range = label
     current_rep = None
     rep_pattern = re.compile(r'^(' + '|'.join(REPS) + r')\s*(Accounts?)?[:\s]', re.IGNORECASE)
-    for line in lines:
-        cols = [c.strip().strip('"') for c in line.split(',')]
+    for cols in rows:
+        if not cols: continue
+        first = str(cols[0]).strip()
+        # Grab date range
         if not date_range or date_range == label:
-            m = re.search(r'\d{2}[/\.]\d{2}[/\.]\d{2,4}.*\d{2}[/\.]\d{2}[/\.]\d{2,4}', cols[0])
+            m = re.search(r'\d{2}[/\.]\d{2}[/\.]\d{2,4}.*\d{2}[/\.]\d{2}[/\.]\d{2,4}', first)
             if m:
-                date_range = cols[0].replace(' SALES','').strip()
-        first = cols[0]
+                date_range = first.replace(' SALES','').strip()
+        # Detect rep header
         rm = rep_pattern.match(first)
         if rm:
             rep_name = rm.group(1).strip()
@@ -130,13 +145,13 @@ def parse_csv(source, label=""):
         total_raw = cols[6] if len(cols) > 6 else ''
         total = to_num(total_raw)
         if total == 0: continue
-        product     = cols[1] if len(cols) > 1 else ''
-        bottles_raw = cols[2] if len(cols) > 2 else '0'
-        price_raw   = cols[5] if len(cols) > 5 else '0'
-        comm_raw    = cols[8] if len(cols) > 8 else '0'
+        product     = str(cols[1]).strip() if len(cols) > 1 else ''
+        bottles_raw = str(cols[2]).strip() if len(cols) > 2 else '0'
+        price_raw   = str(cols[5]).strip() if len(cols) > 5 else '0'
+        comm_raw    = str(cols[8]).strip() if len(cols) > 8 else '0'
         records.append({
             'rep': current_rep, 'customer': first, 'product': product,
-            'bottles': int(bottles_raw) if str(bottles_raw).isdigit() else 0,
+            'bottles': int(bottles_raw) if bottles_raw.isdigit() else 0,
             'price': to_num(price_raw), 'total': total, 'commission': to_num(comm_raw),
         })
     return pd.DataFrame(records), date_range
@@ -152,46 +167,49 @@ def extract_date(s):
 
 def fmt(v): return f"${v:,.2f}"
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("<div style='padding:1rem 0 1.6rem'><div style='font-family:Playfair Display,serif;font-size:1.25rem;color:#f0ece4;font-weight:700'>Winston Quinn</div><div style='font-size:0.65rem;color:#5a5045;letter-spacing:0.2em;text-transform:uppercase;margin-top:0.2rem'>Sales Dashboard</div></div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:0.72rem;color:#8a7d6b;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.5rem'>Upload Fortnight CSVs</div>", unsafe_allow_html=True)
-    uploaded = st.file_uploader("CSVs", type="csv", accept_multiple_files=True, label_visibility="collapsed")
-    st.markdown("<div style='font-size:0.65rem;color:#3a3530;margin-top:0.4rem'>In Google Sheets: open each fortnight tab → File → Download → CSV</div>", unsafe_allow_html=True)
-    st.markdown("<hr style='border-color:#1e1a14;margin:1.2rem 0'>", unsafe_allow_html=True)
-    rep_filter = st.selectbox("Filter by Rep", ["All Reps","Max","Luke","James","WQ","Tristan","Erica"])
+# ── Load all sheets ───────────────────────────────────────────────────────────
+with st.spinner("Connecting to Google Sheets…"):
+    try:
+        all_sheet_names = get_sheet_names()
+    except Exception as e:
+        st.error(f"Could not connect to Google Sheets: {e}")
+        st.stop()
 
-# ── Load data ─────────────────────────────────────────────────────────────────
-BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# Sheet 0 = Database, Sheet 1 = Duplicator template, Sheet 2+ = Fortnights
+fortnight_names = all_sheet_names[2:]
+
+@st.cache_data(ttl=300)
+def load_fortnight(title):
+    rows = get_sheet_rows(title)
+    df, date_range = parse_rows(rows, title)
+    return df, date_range
+
 all_fortnights = []
-
-if os.path.isdir(BUNDLED):
-    for fp in sorted(os.listdir(BUNDLED)):
-        if not fp.endswith('.csv'): continue
-        df, dr = parse_csv(os.path.join(BUNDLED, fp), fp)
-        if not df.empty:
-            all_fortnights.append({'label': dr or fp, 'df': df, 'date': extract_date(dr or fp)})
-
-for uf in (uploaded or []):
-    uf.seek(0)
-    df, dr = parse_csv(uf, uf.name)
+for name in fortnight_names:
+    df, dr = load_fortnight(name)
     if not df.empty:
-        all_fortnights.append({'label': dr or uf.name, 'df': df, 'date': extract_date(dr or uf.name)})
+        all_fortnights.append({'label': dr or name, 'sheet': name, 'df': df, 'date': extract_date(dr or name)})
 
 all_fortnights.sort(key=lambda x: x['date'] or datetime.min)
 
 if not all_fortnights:
-    st.markdown('<div class="wq-title">Sales Dashboard</div>', unsafe_allow_html=True)
-    st.markdown('<div class="wq-sub">Winston Quinn Gin</div>', unsafe_allow_html=True)
-    st.info("👈  Upload your fortnight CSV files using the sidebar to get started.\n\nIn Google Sheets: open each fortnight tab → **File → Download → Comma Separated Values (.csv)**")
+    st.warning("No fortnight data found in the spreadsheet yet.")
     st.stop()
 
 fn_labels = [f['label'] for f in all_fortnights]
 
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("<hr style='border-color:#1e1a14;margin:0.5rem 0 1rem'>", unsafe_allow_html=True)
+    st.markdown("<div style='padding:1rem 0 1.6rem'><div style='font-family:Playfair Display,serif;font-size:1.25rem;color:#f0ece4;font-weight:700'>Winston Quinn</div><div style='font-size:0.65rem;color:#5a5045;letter-spacing:0.2em;text-transform:uppercase;margin-top:0.2rem'>Sales Dashboard</div></div>", unsafe_allow_html=True)
     current_label = st.selectbox("Current Fortnight", fn_labels, index=len(fn_labels)-1)
-    compare_label = st.selectbox("Compare Against",   fn_labels, index=max(0,len(fn_labels)-2))
+    compare_label = st.selectbox("Compare Against",   fn_labels, index=max(0, len(fn_labels)-2))
+    st.markdown("<hr style='border-color:#1e1a14;margin:1rem 0'>", unsafe_allow_html=True)
+    rep_filter = st.selectbox("Filter by Rep", ["All Reps","Max","Luke","James","WQ","Tristan","Erica"])
+    st.markdown("<hr style='border-color:#1e1a14;margin:1rem 0'>", unsafe_allow_html=True)
+    if st.button("⟳  Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    st.markdown("<div style='font-size:0.65rem;color:#3a3530;margin-top:0.5rem'>Live from Google Sheets · refreshes every 5 min</div>", unsafe_allow_html=True)
 
 curr_fn = next(f for f in all_fortnights if f['label']==current_label)
 prev_fn = next(f for f in all_fortnights if f['label']==compare_label)
@@ -216,8 +234,8 @@ dcls         = "up" if pct >= 0 else "down"
 
 k1,k2,k3,k4 = st.columns(4)
 for col,lbl,val,sub,cls in [
-    (k1,"Fortnight Sales",  fmt(curr_sales),   f"{arrow} {abs(pct):.1f}% vs {compare_label}", dcls),
-    (k2,"Total Commission", fmt(curr_comm),    f"{comm_rate:.1f}% commission rate", ""),
+    (k1,"Fortnight Sales",  fmt(curr_sales),    f"{arrow} {abs(pct):.1f}% vs {compare_label}", dcls),
+    (k2,"Total Commission", fmt(curr_comm),     f"{comm_rate:.1f}% commission rate", ""),
     (k3,"Bottles Sold",     f"{curr_bottles:,}","This fortnight", ""),
     (k4,"Active Accounts",  str(curr_df['customer'].nunique()), f"{curr_df['rep'].nunique()} reps active", ""),
 ]:
@@ -244,13 +262,11 @@ with tab1:
         adf['month'] = adf['date'].dt.to_period('M').dt.to_timestamp()
         mon = adf.groupby('month').agg(Sales=('total','sum'), Commission=('commission','sum')).reset_index()
         mon['Month'] = mon['month'].dt.strftime('%b %Y')
-
         fig = go.Figure()
         fig.add_bar(x=mon['Month'], y=mon['Sales'], name='Sales', marker_color=GOLD, marker_line_width=0)
         fig.add_bar(x=mon['Month'], y=mon['Commission'], name='Commission', marker_color='#4a7c59', marker_line_width=0)
-        apply_layout(fig, horizontal_legend=True,
-                     title='Sales & Commission by Month', barmode='group',
-                     yaxis_tickprefix='$', xaxis_tickangle=-30, height=400)
+        apply_layout(fig, horizontal_legend=True, title='Sales & Commission by Month',
+                     barmode='group', yaxis_tickprefix='$', xaxis_tickangle=-30, height=400)
         st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("#### Sales by SKU (all time)")
@@ -269,7 +285,6 @@ with tab2:
     ms = cust[cust['pct'] < 0.02]['total'].sum()
     if ms > 0:
         major = pd.concat([major, pd.DataFrame([{'customer':'Other','total':ms,'pct':ms/tc}])], ignore_index=True)
-
     cl,cr = st.columns(2)
     with cl:
         fig3 = px.pie(major, names='customer', values='total', hole=0.48,
@@ -283,7 +298,6 @@ with tab2:
                       color_continuous_scale=['#2a2520',GOLD], labels={'total':'Sales ($)','customer':''})
         apply_layout(fig4, title='Top Customers', coloraxis_showscale=False, height=450)
         st.plotly_chart(fig4, use_container_width=True)
-
     with st.expander("Full customer table"):
         t = cust[['customer','total','pct']].copy()
         t.columns = ['Customer','Sales','% Share']
@@ -302,19 +316,15 @@ with tab3:
                    'Accounts':df['customer'].nunique()})
     smry = pd.DataFrame(sr)
     smry['% Change'] = smry['Sales'].pct_change() * 100
-
     fig5 = go.Figure()
     fig5.add_bar(x=smry['Fortnight'], y=smry['Sales'], name='Sales',
                  marker_color=GOLD, marker_line_width=0, yaxis='y')
     fig5.add_scatter(x=smry['Fortnight'], y=smry['% Change'], name='% Change',
                      mode='lines+markers', line=dict(color=GREEN, width=2),
                      marker=dict(size=7, color=GREEN), yaxis='y2')
-
     fig5.update_layout(**PLOT_BASE)
     fig5.update_layout(
-        title='Sales & Period-on-Period % Change',
-        xaxis_tickangle=-30,
-        height=400,
+        title='Sales & Period-on-Period % Change', xaxis_tickangle=-30, height=400,
         yaxis=dict(title='Sales ($)', tickprefix='$', gridcolor='#1e1a14', linecolor='#2a2520'),
         yaxis2=dict(title='% Change', overlaying='y', side='right',
                     ticksuffix='%', zeroline=True, zerolinecolor='#2a2520'),
@@ -328,7 +338,6 @@ with tab3:
     dp = (ds / pr2['Sales'] * 100) if pr2['Sales'] else 0
     dc = cr2['Commission'] - pr2['Commission']
     db = cr2['Bottles'] - pr2['Bottles']
-
     st.markdown(f"<div class='section-rule'></div><h4 style='color:#f0ece4'>{current_label} vs {compare_label}</h4>", unsafe_allow_html=True)
     dc1,dc2,dc3 = st.columns(3)
     for col,lbl,val,sub,cls in [
@@ -338,7 +347,6 @@ with tab3:
     ]:
         col.markdown(f"""<div class="kpi-card"><div class="kpi-label">{lbl}</div>
         <div class="kpi-value">{val}</div><div class="kpi-delta {cls}">{sub}</div></div>""", unsafe_allow_html=True)
-
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
     t2 = smry.copy()
     t2['Sales'] = t2['Sales'].map(fmt)
@@ -353,7 +361,6 @@ with tab4:
         Sales=('total','sum'), Commission=('commission','sum'),
         Bottles=('bottles','sum'), Accounts=('customer','nunique')
     ).reset_index().sort_values('Sales', ascending=False)
-
     rcols = st.columns(min(len(rs), 5))
     for i,(_,row) in enumerate(rs.iterrows()):
         rate = (row['Commission'] / row['Sales'] * 100) if row['Sales'] else 0
@@ -365,7 +372,6 @@ with tab4:
             <div class="kpi-delta">{fmt(row['Commission'])} comm · {rate:.1f}%</div>
             <div class="kpi-delta" style="margin-top:0.15rem">{int(row['Bottles'])} btl · {int(row['Accounts'])} accts</div>
             </div>""", unsafe_allow_html=True)
-
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
     cl2,cr2 = st.columns(2)
     with cl2:
@@ -380,7 +386,6 @@ with tab4:
                       color_continuous_scale=['#2a2520',GOLD], labels={'product':'','total':'Sales ($)'})
         apply_layout(fig7, title='Sales by SKU', coloraxis_showscale=False, height=260)
         st.plotly_chart(fig7, use_container_width=True)
-
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
     st.markdown("#### Line Detail")
     det = curr_df[['rep','customer','product','bottles','price','total','commission']].copy()
