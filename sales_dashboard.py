@@ -117,7 +117,11 @@ def get_sheet_rows(title):
 # ── Parser ────────────────────────────────────────────────────────────────────
 def to_num(s):
     if not s: return 0.0
-    return float(re.sub(r'[$,\s]', '', str(s)) or 0)
+    try:
+        cleaned = re.sub(r'[$,\s]', '', str(s))
+        return float(cleaned) if cleaned else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
 def parse_rows(rows, label=""):
     records = []
