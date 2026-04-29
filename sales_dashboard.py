@@ -103,16 +103,20 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 @st.cache_data(ttl=300)
-def get_sheet_names():
+def load_all_sheets_at_once():
+    """Fetch all sheet data in one batch to stay within API quota."""
+    import time
     client = get_gspread_client()
     ss = client.open_by_key(SPREADSHEET_ID)
-    return [ws.title for ws in ss.worksheets()]
-
-@st.cache_data(ttl=300)
-def get_sheet_rows(title):
-    client = get_gspread_client()
-    ss = client.open_by_key(SPREADSHEET_ID)
-    return ss.worksheet(title).get_all_values()
+    all_worksheets = ss.worksheets()
+    # Sheet 0 = Database, Sheet 1 = Duplicator, Sheet 2+ = Fortnights
+    fortnight_worksheets = all_worksheets[2:]
+    results = {}
+    for i, ws in enumerate(fortnight_worksheets):
+        if i > 0:
+            time.sleep(1.2)  # stay well under 60 reads/min
+        results[ws.title] = ws.get_all_values()
+    return results
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 def to_num(s):
@@ -172,25 +176,16 @@ def extract_date(s):
 def fmt(v): return f"${v:,.2f}"
 
 # ── Load all sheets ───────────────────────────────────────────────────────────
-with st.spinner("Connecting to Google Sheets…"):
+with st.spinner("Loading data from Google Sheets…"):
     try:
-        all_sheet_names = get_sheet_names()
+        all_sheets_data = load_all_sheets_at_once()
     except Exception as e:
         st.error(f"Could not connect to Google Sheets: {e}")
         st.stop()
 
-# Sheet 0 = Database, Sheet 1 = Duplicator template, Sheet 2+ = Fortnights
-fortnight_names = all_sheet_names[2:]
-
-@st.cache_data(ttl=300)
-def load_fortnight(title):
-    rows = get_sheet_rows(title)
-    df, date_range = parse_rows(rows, title)
-    return df, date_range
-
 all_fortnights = []
-for name in fortnight_names:
-    df, dr = load_fortnight(name)
+for name, rows in all_sheets_data.items():
+    df, dr = parse_rows(rows, name)
     if not df.empty:
         all_fortnights.append({'label': dr or name, 'sheet': name, 'df': df, 'date': extract_date(dr or name)})
 
